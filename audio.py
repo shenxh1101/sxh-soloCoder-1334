@@ -150,6 +150,15 @@ class AudioPlayer:
         self._player.stop()
         self._current_type = None
 
+    def pause(self):
+        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._player.pause()
+
+    def resume(self):
+        if self._current_type is not None and \
+           self._player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
+            self._player.play()
+
     def set_volume(self, volume):
         self._audio_output.setVolume(max(0.0, min(1.0, volume)))
 

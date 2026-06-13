@@ -4,6 +4,9 @@ import json
 from datetime import datetime, timedelta
 
 
+DEFAULT_CATEGORIES = ["工作", "学习", "生活", "健康", "娱乐", "其他"]
+
+
 class Database:
     def __init__(self, db_path=None):
         if db_path is None:
@@ -14,6 +17,7 @@ class Database:
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self._create_tables()
+        self._migrate_schema()
 
     def _create_tables(self):
         cursor = self.conn.cursor()
@@ -25,7 +29,9 @@ class Database:
                 completed INTEGER DEFAULT 0,
                 pomodoros_completed INTEGER DEFAULT 0,
                 pomodoros_target INTEGER DEFAULT 1,
-                completed_at TEXT
+                completed_at TEXT,
+                category TEXT DEFAULT '工作',
+                notes TEXT DEFAULT ''
             )
         """)
         cursor.execute("""
@@ -53,6 +59,18 @@ class Database:
         """)
         self.conn.commit()
 
+    def _migrate_schema(self):
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN category TEXT DEFAULT '工作'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN notes TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        self.conn.commit()
+
     def get_config(self, key, default=None):
         cursor = self.conn.cursor()
         cursor.execute("SELECT value FROM config WHERE key=?", (key,))
@@ -72,11 +90,20 @@ class Database:
         )
         self.conn.commit()
 
-    def add_task(self, name, pomodoros_target=1):
+    def get_categories(self):
+        stored = self.get_config("task_categories", None)
+        if stored and isinstance(stored, list):
+            return stored
+        return DEFAULT_CATEGORIES[:]
+
+    def set_categories(self, categories):
+        self.set_config("task_categories", list(categories))
+
+    def add_task(self, name, pomodoros_target=1, category="工作", notes=""):
         cursor = self.conn.cursor()
         cursor.execute(
-            "INSERT INTO tasks (name, created_at, pomodoros_target) VALUES (?, ?, ?)",
-            (name, datetime.now().isoformat(), pomodoros_target),
+            "INSERT INTO tasks (name, created_at, pomodoros_target, category, notes) VALUES (?, ?, ?, ?, ?)",
+            (name, datetime.now().isoformat(), pomodoros_target, category, notes),
         )
         self.conn.commit()
         return cursor.lastrowid
@@ -97,11 +124,53 @@ class Database:
         )
         self.conn.commit()
 
+    def uncomplete_task(self, task_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE tasks SET completed=0, completed_at=NULL WHERE id=?",
+            (task_id,),
+        )
+        self.conn.commit()
+
+    def align_task_completion_state(self, task_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT completed, pomodoros_completed, pomodoros_target FROM tasks WHERE id=?",
+            (task_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return
+        completed = row["completed"]
+        done = row["pomodoros_completed"]
+        target = row["pomodoros_target"]
+        should_be_complete = done >= target
+        if should_be_complete and not completed:
+            self.complete_task(task_id)
+        elif not should_be_complete and completed:
+            self.uncomplete_task(task_id)
+
     def update_task_name(self, task_id, new_name):
         cursor = self.conn.cursor()
         cursor.execute(
             "UPDATE tasks SET name=? WHERE id=?",
             (new_name, task_id),
+        )
+        self.conn.commit()
+
+    def update_task_category(self, task_id, new_category):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE tasks SET category=? WHERE id=?",
+            (new_category, task_id),
+        )
+        self.conn.commit()
+
+    def update_task_notes(self, task_id, notes):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE tasks SET notes=? WHERE id=?",
+            (notes, task_id),
         )
         self.conn.commit()
 
@@ -112,6 +181,7 @@ class Database:
             (max(1, new_target), task_id),
         )
         self.conn.commit()
+        self.align_task_completion_state(task_id)
 
     def update_task_pomodoro(self, task_id, increment=1):
         cursor = self.conn.cursor()
@@ -120,6 +190,7 @@ class Database:
             (increment, task_id),
         )
         self.conn.commit()
+        self.align_task_completion_state(task_id)
 
     def delete_task(self, task_id):
         cursor = self.conn.cursor()
@@ -250,7 +321,7 @@ class Database:
     def get_records_with_task_names(self, start_date=None, end_date=None, record_type=None):
         cursor = self.conn.cursor()
         query = """
-            SELECT pr.*, t.name as task_name
+            SELECT pr.*, t.name as task_name, t.category as task_category
             FROM pomodoro_records pr
             LEFT JOIN tasks t ON pr.task_id = t.id
             WHERE 1=1
@@ -272,7 +343,7 @@ class Database:
     def get_task_time_ranking(self, start_date=None, end_date=None, limit=10):
         cursor = self.conn.cursor()
         query = """
-            SELECT t.id as task_id, t.name as task_name,
+            SELECT t.id as task_id, t.name as task_name, t.category as task_category,
                    COUNT(pr.id) as pomodoro_count,
                    SUM(pr.duration_minutes) as total_minutes
             FROM pomodoro_records pr
@@ -294,8 +365,69 @@ class Database:
             d = dict(row)
             if d["task_name"] is None:
                 d["task_name"] = "未指定任务"
+            if d["task_category"] is None:
+                d["task_category"] = "其他"
             results.append(d)
         return results
+
+    def get_category_time_ranking(self, start_date=None, end_date=None, limit=10):
+        cursor = self.conn.cursor()
+        query = """
+            SELECT COALESCE(t.category, '其他') as category,
+                   COUNT(DISTINCT pr.task_id) as task_count,
+                   COUNT(pr.id) as pomodoro_count,
+                   SUM(pr.duration_minutes) as total_minutes
+            FROM pomodoro_records pr
+            LEFT JOIN tasks t ON pr.task_id = t.id
+            WHERE pr.type='work'
+        """
+        params = []
+        if start_date:
+            query += " AND pr.started_at>=?"
+            params.append(start_date)
+        if end_date:
+            query += " AND pr.started_at<=?"
+            params.append(end_date)
+        query += " GROUP BY COALESCE(t.category, '其他') ORDER BY total_minutes DESC LIMIT ?"
+        params.append(limit)
+        cursor.execute(query, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_daily_work_heatmap(self, days=60):
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days - 1)
+        start_str = start_date.strftime("%Y-%m-%d") + "T00:00:00"
+        end_str = end_date.strftime("%Y-%m-%d") + "T23:59:59"
+        records = self.get_records(start_str, end_str, "work")
+        daily = {}
+        hourly = {}
+        for h in range(24):
+            hourly[h] = 0
+        for r in records:
+            day = r["started_at"][:10]
+            daily[day] = daily.get(day, 0) + r["duration_minutes"]
+            try:
+                h = int(r["started_at"][11:13])
+                hourly[h] = hourly.get(h, 0) + r["duration_minutes"]
+            except (ValueError, KeyError, IndexError):
+                pass
+        calendar = []
+        cur = start_date
+        while cur <= end_date:
+            ds = cur.strftime("%Y-%m-%d")
+            calendar.append({
+                "date": ds,
+                "date_short": cur.strftime("%m-%d"),
+                "weekday": cur.weekday(),
+                "minutes": daily.get(ds, 0),
+            })
+            cur += timedelta(days=1)
+        return {
+            "calendar": calendar,
+            "hourly": [{"hour": h, "minutes": hourly[h]} for h in range(24)],
+            "total_minutes": sum(daily.values()),
+            "active_days": len([v for v in daily.values() if v > 0]),
+        }
 
     def get_efficiency_trend(self, days=14):
         end_date = datetime.now()

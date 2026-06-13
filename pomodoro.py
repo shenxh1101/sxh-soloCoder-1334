@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QListWidget, QListWidgetItem, QLineEdit,
     QSpinBox, QSlider, QDialog, QFormLayout, QGroupBox,
     QCheckBox, QStackedWidget, QSizePolicy, QMessageBox,
-    QSystemTrayIcon, QMenu,
+    QSystemTrayIcon, QMenu, QPlainTextEdit,
 )
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPoint, QPointF
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QRadialGradient, QAction, QIcon, QPixmap
@@ -285,6 +285,13 @@ class PomodoroWindow(QWidget):
         self.pomodoro_target_spin.setRange(1, 20)
         self.pomodoro_target_spin.setValue(1)
         target_layout.addWidget(self.pomodoro_target_spin)
+        target_layout.addSpacing(8)
+        target_layout.addWidget(QLabel("分类:"))
+        self.new_task_category_combo = QComboBox()
+        for cat in self.db.get_categories():
+            self.new_task_category_combo.addItem(cat)
+        self.new_task_category_combo.setMinimumWidth(80)
+        target_layout.addWidget(self.new_task_category_combo)
         target_layout.addStretch()
         left_layout.addLayout(target_layout)
         self.task_list = QListWidget()
@@ -518,14 +525,18 @@ class PomodoroWindow(QWidget):
         self._is_paused = True
         self.start_btn.setText("▶ 继续")
         self.overlay.hide_overlay()
+        if self.state == self.STATE_WORK:
+            self.audio_player.pause()
         self._update_display()
 
     def _resume(self):
         self.timer.start()
         self._is_paused = False
         self.start_btn.setText("⏸ 暂停")
-        if self.show_overlay:
-            self.overlay.show_overlay()
+        if self.state == self.STATE_WORK:
+            if self.show_overlay:
+                self.overlay.show_overlay()
+            self.audio_player.resume()
         self._update_display()
 
     def _reset(self):
@@ -668,6 +679,14 @@ class PomodoroWindow(QWidget):
         self._is_paused = False
         self.start_btn.setText("⏸ 暂停")
         self.skip_btn.setEnabled(True)
+        try:
+            self.start_btn.clicked.disconnect()
+        except TypeError:
+            pass
+        self.start_btn.clicked.connect(self._on_start_or_pause)
+        self.overlay.hide_overlay()
+        self.website_blocker.unblock_sites()
+        self.audio_player.stop()
         self.timer.start()
         self._update_display()
 
@@ -707,18 +726,14 @@ class PomodoroWindow(QWidget):
             self._start_work()
 
     def _start_short_break_from_btn(self):
-        try:
-            self.start_btn.clicked.disconnect()
-        except TypeError:
-            pass
-        self.start_btn.clicked.connect(self._on_start_or_pause)
         self._enter_break_state(is_long=False)
 
     def _add_task(self):
         name = self.task_input.text().strip()
         if name:
             target = self.pomodoro_target_spin.value()
-            new_id = self.db.add_task(name, target)
+            category = self.new_task_category_combo.currentText() or "工作"
+            new_id = self.db.add_task(name, target, category, "")
             self.task_input.clear()
             self._refresh_tasks()
             for i in range(self.task_list.count()):
@@ -741,13 +756,19 @@ class PomodoroWindow(QWidget):
                     )
                     return
                 self.current_task_id = task_id
-                self.current_task_label.setText(f"当前任务: {task['name']}")
+                cat = task.get("category", "") or ""
+                cat_tag = f" [{cat}]" if cat else ""
+                self.current_task_label.setText(f"当前任务: {task['name']}{cat_tag}")
                 self.current_task_label.setStyleSheet(
                     "font-size: 13px; color: #2c3e50; padding: 8px; "
                     "background: #e3f2fd; border-radius: 6px; "
                     "border: 1px solid #90caf9; font-weight: bold;"
                 )
                 self.pomodoro_target_spin.setValue(task.get("pomodoros_target", 1))
+                if cat:
+                    ci = self.new_task_category_combo.findText(cat)
+                    if ci >= 0:
+                        self.new_task_category_combo.setCurrentIndex(ci)
 
     def _edit_task(self):
         current = self.task_list.currentItem()
@@ -760,19 +781,38 @@ class PomodoroWindow(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("编辑任务")
-        dialog.setMinimumWidth(380)
+        dialog.setMinimumWidth(420)
+        dialog.setMinimumHeight(420)
         layout = QFormLayout(dialog)
         name_input = QLineEdit(task["name"])
         layout.addRow("任务名称:", name_input)
+        cat_layout = QHBoxLayout()
+        category_combo = QComboBox()
+        for cat in self.db.get_categories():
+            category_combo.addItem(cat)
+        task_cat = task.get("category", "工作") or "工作"
+        idx = category_combo.findText(task_cat)
+        if idx >= 0:
+            category_combo.setCurrentIndex(idx)
+        else:
+            category_combo.addItem(task_cat)
+            category_combo.setCurrentText(task_cat)
+        cat_layout.addWidget(category_combo)
+        cat_layout.addStretch()
+        layout.addRow("分类:", cat_layout)
         target_spin = QSpinBox()
         target_spin.setRange(1, 100)
         target_spin.setValue(task.get("pomodoros_target", 1))
         layout.addRow("目标番茄数:", target_spin)
+        notes_input = QPlainTextEdit(task.get("notes", "") or "")
+        notes_input.setPlaceholderText("任务备注、参考链接、要点记录...")
+        notes_input.setMinimumHeight(100)
+        layout.addRow("备注:", notes_input)
         info_label = QLabel(
             f"已完成: {task.get('pomodoros_completed', 0)} 个番茄\n"
-            f"修改目标番茄数不会影响已完成的进度。"
+            f"修改目标番茄数会自动对齐完成状态（进度够了自动完成，不够则恢复未完成）。"
         )
-        info_label.setStyleSheet("color: #666; font-size: 12px; padding: 8px; background: #f8f9fa; border-radius: 4px;")
+        info_label.setStyleSheet("color: #555; font-size: 12px; padding: 8px; background: #f8f9fa; border-radius: 4px;")
         layout.addRow("", info_label)
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("保存")
@@ -790,7 +830,9 @@ class PomodoroWindow(QWidget):
                 QMessageBox.warning(dialog, "提示", "任务名称不能为空。")
                 return
             self.db.update_task_name(task_id, new_name)
+            self.db.update_task_category(task_id, category_combo.currentText())
             self.db.update_task_target(task_id, target_spin.value())
+            self.db.update_task_notes(task_id, notes_input.toPlainText())
             result[0] = True
             dialog.accept()
         save_btn.clicked.connect(on_save)
@@ -800,7 +842,9 @@ class PomodoroWindow(QWidget):
             if self.current_task_id == task_id:
                 updated = self._get_task_by_id(task_id)
                 if updated:
-                    self.current_task_label.setText(f"当前任务: {updated['name']}")
+                    cat = updated.get("category", "") or ""
+                    cat_tag = f" [{cat}]" if cat else ""
+                    self.current_task_label.setText(f"当前任务: {updated['name']}{cat_tag}")
 
     def _complete_task(self):
         current = self.task_list.currentItem()
@@ -854,6 +898,7 @@ class PomodoroWindow(QWidget):
         incomplete = []
         completed = []
         for task in self.db.get_tasks():
+            self.db.align_task_completion_state(task["id"])
             if task.get("completed", 0):
                 completed.append(task)
             else:
@@ -861,7 +906,9 @@ class PomodoroWindow(QWidget):
         sorted_tasks = incomplete + completed
         for task in sorted_tasks:
             status = "✅" if task.get("completed", 0) else "⬜"
-            item_text = f"{status} {task['name']} ({task['pomodoros_completed']}/{task['pomodoros_target']})"
+            cat = task.get("category", "") or ""
+            cat_tag = f"[{cat}] " if cat else ""
+            item_text = f"{status} {cat_tag}{task['name']} ({task['pomodoros_completed']}/{task['pomodoros_target']})"
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, task["id"])
             if task.get("completed", 0):
@@ -879,7 +926,9 @@ class PomodoroWindow(QWidget):
                     )
                     self.current_task_id = None
                 else:
-                    self.current_task_label.setText(f"当前任务: {task['name']}")
+                    cat = task.get("category", "") or ""
+                    cat_tag = f" [{cat}]" if cat else ""
+                    self.current_task_label.setText(f"当前任务: {task['name']}{cat_tag}")
                     self.current_task_label.setStyleSheet(
                         "font-size: 13px; color: #2c3e50; padding: 8px; "
                         "background: #e3f2fd; border-radius: 6px; "
