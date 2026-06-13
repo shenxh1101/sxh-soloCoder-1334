@@ -31,7 +31,9 @@ class Database:
                 pomodoros_target INTEGER DEFAULT 1,
                 completed_at TEXT,
                 category TEXT DEFAULT '工作',
-                notes TEXT DEFAULT ''
+                notes TEXT DEFAULT '',
+                archived INTEGER DEFAULT 0,
+                archived_at TEXT
             )
         """)
         cursor.execute("""
@@ -67,6 +69,14 @@ class Database:
             pass
         try:
             cursor.execute("ALTER TABLE tasks ADD COLUMN notes TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN archived INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN archived_at TEXT")
         except sqlite3.OperationalError:
             pass
         self.conn.commit()
@@ -108,12 +118,16 @@ class Database:
         self.conn.commit()
         return cursor.lastrowid
 
-    def get_tasks(self, include_completed=True):
+    def get_tasks(self, include_completed=True, include_archived=False):
         cursor = self.conn.cursor()
-        if include_completed:
-            cursor.execute("SELECT * FROM tasks ORDER BY completed, created_at DESC")
-        else:
-            cursor.execute("SELECT * FROM tasks WHERE completed=0 ORDER BY created_at DESC")
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params = []
+        if not include_completed:
+            query += " AND completed=0"
+        if not include_archived:
+            query += " AND archived=0"
+        query += " ORDER BY archived, completed, created_at DESC"
+        cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
 
     def complete_task(self, task_id):
@@ -128,6 +142,22 @@ class Database:
         cursor = self.conn.cursor()
         cursor.execute(
             "UPDATE tasks SET completed=0, completed_at=NULL WHERE id=?",
+            (task_id,),
+        )
+        self.conn.commit()
+
+    def archive_task(self, task_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE tasks SET archived=1, archived_at=? WHERE id=?",
+            (datetime.now().isoformat(), task_id),
+        )
+        self.conn.commit()
+
+    def unarchive_task(self, task_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE tasks SET archived=0, archived_at=NULL WHERE id=?",
             (task_id,),
         )
         self.conn.commit()
@@ -302,6 +332,251 @@ class Database:
             "tasks_completed": tasks_completed,
             "daily": daily_list,
         }
+
+    def get_summary(self, start_date=None, end_date=None):
+        cursor = self.conn.cursor()
+        query = """
+            SELECT type, COUNT(*) as cnt, SUM(duration_minutes) as total_min
+            FROM pomodoro_records
+            WHERE 1=1
+        """
+        params = []
+        if start_date:
+            query += " AND started_at>=?"
+            params.append(start_date)
+        if end_date:
+            query += " AND started_at<=?"
+            params.append(end_date)
+        query += " GROUP BY type"
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        result = {
+            "work_minutes": 0,
+            "work_count": 0,
+            "break_minutes": 0,
+            "break_count": 0,
+            "long_break_minutes": 0,
+            "long_break_count": 0,
+            "abandoned_minutes": 0,
+            "abandoned_count": 0,
+            "skip_break_minutes": 0,
+            "skip_break_count": 0,
+            "task_completed_count": 0,
+        }
+        for r in rows:
+            t = r["type"]
+            cnt = r["cnt"] or 0
+            total = r["total_min"] or 0
+            if t == "work":
+                result["work_minutes"] = total
+                result["work_count"] = cnt
+            elif t == "break":
+                result["break_minutes"] = total
+                result["break_count"] = cnt
+            elif t == "long_break":
+                result["long_break_minutes"] = total
+                result["long_break_count"] = cnt
+            elif t == "abandoned":
+                result["abandoned_minutes"] = total
+                result["abandoned_count"] = cnt
+            elif t == "skip_break":
+                result["skip_break_minutes"] = total
+                result["skip_break_count"] = cnt
+        if start_date and end_date:
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM tasks WHERE completed=1 AND completed_at>=? AND completed_at<=?",
+                (start_date, end_date),
+            )
+            row = cursor.fetchone()
+            result["task_completed_count"] = row["cnt"] if row else 0
+        return result
+
+    def get_daily_task_summary(self, date=None):
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+        start = f"{date}T00:00:00"
+        end = f"{date}T23:59:59"
+        cursor = self.conn.cursor()
+        query = """
+            SELECT pr.task_id, t.name as task_name, t.category as task_category,
+                   COUNT(pr.id) as pomodoro_count,
+                   SUM(pr.duration_minutes) as total_minutes
+            FROM pomodoro_records pr
+            LEFT JOIN tasks t ON pr.task_id = t.id
+            WHERE pr.type='work' AND pr.started_at>=? AND pr.started_at<=?
+            GROUP BY pr.task_id
+            ORDER BY total_minutes DESC
+        """
+        cursor.execute(query, (start, end))
+        results = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            if d["task_name"] is None:
+                d["task_name"] = "未指定任务"
+            if d["task_category"] is None:
+                d["task_category"] = "其他"
+            results.append(d)
+        return results
+
+    def get_daily_category_summary(self, date=None):
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+        start = f"{date}T00:00:00"
+        end = f"{date}T23:59:59"
+        cursor = self.conn.cursor()
+        query = """
+            SELECT COALESCE(t.category, '其他') as category,
+                   COUNT(DISTINCT pr.task_id) as task_count,
+                   COUNT(pr.id) as pomodoro_count,
+                   SUM(pr.duration_minutes) as total_minutes
+            FROM pomodoro_records pr
+            LEFT JOIN tasks t ON pr.task_id = t.id
+            WHERE pr.type='work' AND pr.started_at>=? AND pr.started_at<=?
+            GROUP BY COALESCE(t.category, '其他')
+            ORDER BY total_minutes DESC
+        """
+        cursor.execute(query, (start, end))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def generate_daily_report(self, date=None):
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+        date_obj = datetime.strptime(date, "%Y-%m-%d")
+        weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][date_obj.weekday()]
+        summary = self.get_summary(f"{date}T00:00:00", f"{date}T23:59:59")
+        tasks = self.get_daily_task_summary(date)
+        categories = self.get_daily_category_summary(date)
+        work_min = summary["work_minutes"]
+        work_count = summary["work_count"]
+        break_min = summary["break_minutes"] + summary["long_break_minutes"]
+        completed_count = summary["task_completed_count"]
+        h_work, m_work = divmod(work_min, 60)
+        h_break, m_break = divmod(break_min, 60)
+        work_str = f"{h_work}小时{m_work}分钟" if h_work > 0 else f"{m_work}分钟"
+        break_str = f"{h_break}小时{m_break}分钟" if h_break > 0 else f"{m_break}分钟"
+        lines = []
+        lines.append(f"📅 {date}（{weekday_cn}）工作日志")
+        lines.append("=" * 40)
+        lines.append("")
+        lines.append("⏱ 今日概览")
+        lines.append(f"  🍅 专注：{work_count} 次 · {work_str}")
+        lines.append(f"  ☕ 休息：{break_str}")
+        lines.append(f"  ✅ 完成任务：{completed_count} 个")
+        lines.append("")
+        if categories:
+            lines.append("📂 分类投入")
+            for i, c in enumerate(categories, 1):
+                cat_min = c["total_minutes"]
+                cat_h, cat_m = divmod(cat_min, 60)
+                cat_str = f"{cat_h}小时{cat_m}分钟" if cat_h > 0 else f"{cat_m}分钟"
+                lines.append(f"  {i}. {c['category']}：{cat_str} ({c['pomodoro_count']}🍅, {c['task_count']}个任务)")
+            lines.append("")
+        if tasks:
+            lines.append("📝 任务明细")
+            for i, t in enumerate(tasks, 1):
+                t_min = t["total_minutes"]
+                t_h, t_m = divmod(t_min, 60)
+                t_str = f"{t_h}小时{t_m}分钟" if t_h > 0 else f"{t_m}分钟"
+                cat_tag = f" [{t['task_category']}]" if t["task_category"] else ""
+                lines.append(f"  {i}. {t['task_name']}{cat_tag}")
+                lines.append(f"     投入：{t_str} · {t['pomodoro_count']} 个番茄")
+            lines.append("")
+        lines.append("— 番茄钟专注助手自动生成 —")
+        return "\n".join(lines)
+
+    def generate_weekly_report(self, end_date=None):
+        if end_date is None:
+            end_date = datetime.now()
+        start_date = end_date - timedelta(days=end_date.weekday())
+        end_date_dt = start_date + timedelta(days=6)
+        start_str = start_date.strftime("%Y-%m-%d") + "T00:00:00"
+        end_str = end_date_dt.strftime("%Y-%m-%d") + "T23:59:59"
+        summary = self.get_summary(start_str, end_str)
+        work_min = summary["work_minutes"]
+        work_count = summary["work_count"]
+        break_min = summary["break_minutes"] + summary["long_break_minutes"]
+        completed_count = summary["task_completed_count"]
+        h_work, m_work = divmod(work_min, 60)
+        work_str = f"{h_work}小时{m_work}分钟" if h_work > 0 else f"{m_work}分钟"
+        cursor = self.conn.cursor()
+        query = """
+            SELECT pr.task_id, t.name as task_name, t.category as task_category,
+                   COUNT(pr.id) as pomodoro_count,
+                   SUM(pr.duration_minutes) as total_minutes
+            FROM pomodoro_records pr
+            LEFT JOIN tasks t ON pr.task_id = t.id
+            WHERE pr.type='work' AND pr.started_at>=? AND pr.started_at<=?
+            GROUP BY pr.task_id
+            ORDER BY total_minutes DESC
+        """
+        cursor.execute(query, (start_str, end_str))
+        top_tasks = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            if d["task_name"] is None:
+                d["task_name"] = "未指定任务"
+            if d["task_category"] is None:
+                d["task_category"] = "其他"
+            top_tasks.append(d)
+        cat_query = """
+            SELECT COALESCE(t.category, '其他') as category,
+                   COUNT(DISTINCT pr.task_id) as task_count,
+                   COUNT(pr.id) as pomodoro_count,
+                   SUM(pr.duration_minutes) as total_minutes
+            FROM pomodoro_records pr
+            LEFT JOIN tasks t ON pr.task_id = t.id
+            WHERE pr.type='work' AND pr.started_at>=? AND pr.started_at<=?
+            GROUP BY COALESCE(t.category, '其他')
+            ORDER BY total_minutes DESC
+        """
+        cursor.execute(cat_query, (start_str, end_str))
+        top_cats = [dict(row) for row in cursor.fetchall()]
+        daily = []
+        for i in range(7):
+            d = start_date + timedelta(days=i)
+            ds = d.strftime("%Y-%m-%d")
+            ds_str = ds + "T00:00:00"
+            de_str = ds + "T23:59:59"
+            day_sum = self.get_summary(ds_str, de_str)
+            daily.append({
+                "date": ds,
+                "date_short": d.strftime("%m-%d"),
+                "weekday": ["一", "二", "三", "四", "五", "六", "日"][d.weekday()],
+                "minutes": day_sum["work_minutes"],
+                "pomodoros": day_sum["work_count"],
+            })
+        lines = []
+        lines.append(f"📆 本周工作复盘（{start_date.strftime('%m月%d日')} ~ {end_date_dt.strftime('%m月%d日')}）")
+        lines.append("=" * 48)
+        lines.append("")
+        lines.append("📊 本周总览")
+        lines.append(f"  🍅 专注：{work_count} 次 · {work_str}")
+        lines.append(f"  ✅ 完成任务：{completed_count} 个")
+        lines.append(f"  💪 日均专注：{work_min // 7} 分钟")
+        lines.append("")
+        if daily:
+            lines.append("📅 每日投入")
+            for d in daily:
+                bar = "█" * (d["minutes"] // 15)
+                lines.append(f"  周{d['weekday']} ({d['date_short']})  {d['minutes']:>4}分钟  {bar}")
+            lines.append("")
+        if top_cats:
+            lines.append("📂 分类排行")
+            for i, c in enumerate(top_cats[:5], 1):
+                cat_h, cat_m = divmod(c["total_minutes"], 60)
+                cat_str = f"{cat_h}小时{cat_m}分钟" if cat_h > 0 else f"{cat_m}分钟"
+                lines.append(f"  {i}. {c['category']}：{cat_str} ({c['pomodoro_count']}🍅)")
+            lines.append("")
+        if top_tasks:
+            lines.append("🏆 任务 Top 5")
+            for i, t in enumerate(top_tasks[:5], 1):
+                t_h, t_m = divmod(t["total_minutes"], 60)
+                t_str = f"{t_h}小时{t_m}分钟" if t_h > 0 else f"{t_m}分钟"
+                cat_tag = f" [{t['task_category']}]" if t["task_category"] else ""
+                lines.append(f"  {i}. {t['task_name']}{cat_tag} — {t_str} ({t['pomodoro_count']}🍅)")
+            lines.append("")
+        lines.append("— 番茄钟专注助手自动生成 —")
+        return "\n".join(lines)
 
     def add_blocked_site(self, site):
         cursor = self.conn.cursor()

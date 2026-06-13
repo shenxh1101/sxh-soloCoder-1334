@@ -295,8 +295,35 @@ class PomodoroWindow(QWidget):
         target_layout.addStretch()
         left_layout.addLayout(target_layout)
         self.task_list = QListWidget()
-        self.task_list.setMaximumHeight(180)
+        self.task_list.setMaximumHeight(200)
         left_layout.addWidget(self.task_list)
+        self.archive_toggle_btn = QPushButton("📦 已归档 / 已完成 ▼ (点击展开)")
+        self.archive_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background: #f5f5f5; color: #666; font-size: 12px;
+                padding: 6px 10px; border: 1px solid #ddd; border-radius: 5px;
+                text-align: left;
+            }
+            QPushButton:hover { background: #eee; color: #333; }
+        """)
+        self.archive_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.archive_toggle_btn.clicked.connect(self._toggle_archive_panel)
+        left_layout.addWidget(self.archive_toggle_btn)
+        self.archived_task_list = QListWidget()
+        self.archived_task_list.setMaximumHeight(140)
+        self.archived_task_list.hide()
+        self.archived_task_list.setStyleSheet("""
+            QListWidget {
+                border: 1px solid #e0e0e0;
+                border-radius: 6px;
+                background: #fafafa;
+                font-size: 12px;
+            }
+            QListWidget::item { padding: 6px 8px; color: #999; }
+            QListWidget::item:selected { background: #e3f2fd; color: #1565c0; }
+        """)
+        left_layout.addWidget(self.archived_task_list)
+        self._archive_panel_expanded = False
         task_btn_layout = QHBoxLayout()
         select_btn = QPushButton("选中为当前")
         select_btn.setStyleSheet("background: #3498db; color: white; font-size: 12px; padding: 6px 10px;")
@@ -310,6 +337,10 @@ class PomodoroWindow(QWidget):
         complete_btn.setStyleSheet("background: #27ae60; color: white; font-size: 12px; padding: 6px 10px;")
         complete_btn.clicked.connect(self._complete_task)
         task_btn_layout.addWidget(complete_btn)
+        archive_btn = QPushButton("归档")
+        archive_btn.setStyleSheet("background: #95a5a6; color: white; font-size: 12px; padding: 6px 10px;")
+        archive_btn.clicked.connect(self._archive_or_restore_task)
+        task_btn_layout.addWidget(archive_btn)
         delete_btn = QPushButton("删除")
         delete_btn.setStyleSheet("background: #e74c3c; color: white; font-size: 12px; padding: 6px 10px;")
         delete_btn.clicked.connect(self._delete_task)
@@ -743,16 +774,15 @@ class PomodoroWindow(QWidget):
                     break
 
     def _select_task(self):
-        current = self.task_list.currentItem()
-        if current:
-            task_id = current.data(Qt.ItemDataRole.UserRole)
+        task_id, source_list = self._get_selected_task_id()
+        if task_id:
             task = self._get_task_by_id(task_id)
             if task:
-                if task.get("completed", 0):
+                if task.get("completed", 0) or task.get("archived", 0):
                     QMessageBox.information(
                         self,
-                        "任务已完成",
-                        f"任务「{task['name']}」已经标记为完成。\n请选择一个未完成的任务继续专注。",
+                        "任务已归档/完成",
+                        f"任务「{task['name']}」已归档或已完成。\n请先恢复任务，再选择为当前任务。",
                     )
                     return
                 self.current_task_id = task_id
@@ -771,11 +801,10 @@ class PomodoroWindow(QWidget):
                         self.new_task_category_combo.setCurrentIndex(ci)
 
     def _edit_task(self):
-        current = self.task_list.currentItem()
-        if not current:
+        task_id, _ = self._get_selected_task_id()
+        if not task_id:
             QMessageBox.information(self, "提示", "请先选择一个要编辑的任务。")
             return
-        task_id = current.data(Qt.ItemDataRole.UserRole)
         task = self._get_task_by_id(task_id)
         if not task:
             return
@@ -847,24 +876,26 @@ class PomodoroWindow(QWidget):
                     self.current_task_label.setText(f"当前任务: {updated['name']}{cat_tag}")
 
     def _complete_task(self):
-        current = self.task_list.currentItem()
-        if current:
-            task_id = current.data(Qt.ItemDataRole.UserRole)
+        task_id, _ = self._get_selected_task_id()
+        if task_id:
+            task = self._get_task_by_id(task_id)
+            if task and task.get("completed", 0):
+                QMessageBox.information(self, "提示", "这个任务已经完成了。")
+                return
             self.db.complete_task(task_id)
             if self.current_task_id == task_id:
                 self.current_task_id = None
-                self.current_task_label.setText("当前任务: 无  (⚠ 请先选中一个任务再开始专注)")
+                self.current_task_label.setText("当前任务: 无  (✅ 上一个任务已完成!)")
                 self.current_task_label.setStyleSheet(
-                    "font-size: 13px; color: #e67e22; padding: 8px; "
-                    "background: #fff8e1; border-radius: 6px; "
-                    "border: 1px solid #ffe0b2; font-weight: bold;"
+                    "font-size: 13px; color: #27ae60; padding: 8px; "
+                    "background: #e8f5e9; border-radius: 6px; "
+                    "border: 1px solid #c8e6c9; font-weight: bold;"
                 )
             self._refresh_tasks()
 
     def _delete_task(self):
-        current = self.task_list.currentItem()
-        if current:
-            task_id = current.data(Qt.ItemDataRole.UserRole)
+        task_id, _ = self._get_selected_task_id()
+        if task_id:
             task = self._get_task_by_id(task_id)
             reply = QMessageBox.question(
                 self,
@@ -885,40 +916,114 @@ class PomodoroWindow(QWidget):
                     )
                 self._refresh_tasks()
 
+    def _toggle_archive_panel(self):
+        self._archive_panel_expanded = not self._archive_panel_expanded
+        if self._archive_panel_expanded:
+            self.archived_task_list.show()
+            self.archive_toggle_btn.setText("📦 已归档 / 已完成 ▲ (点击收起)")
+        else:
+            self.archived_task_list.hide()
+            self.archive_toggle_btn.setText("📦 已归档 / 已完成 ▼ (点击展开)")
+
+    def _get_selected_task_id(self):
+        current = self.task_list.currentItem()
+        if current:
+            return current.data(Qt.ItemDataRole.UserRole), self.task_list
+        current = self.archived_task_list.currentItem()
+        if current:
+            return current.data(Qt.ItemDataRole.UserRole), self.archived_task_list
+        return None, None
+
     def _get_task_by_id(self, task_id):
         if task_id is None:
             return None
-        for t in self.db.get_tasks():
+        for t in self.db.get_tasks(include_archived=True):
             if t["id"] == task_id:
                 return t
         return None
 
+    def _archive_or_restore_task(self):
+        task_id, source_list = self._get_selected_task_id()
+        if not task_id:
+            QMessageBox.information(self, "提示", "请先选择一个任务。")
+            return
+        task = self._get_task_by_id(task_id)
+        if not task:
+            return
+        is_archived = task.get("archived", 0) or task.get("completed", 0)
+        if is_archived:
+            reply = QMessageBox.question(
+                self, "恢复任务",
+                f"确定要恢复任务「{task['name']}」到进行中吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.db.unarchive_task(task_id)
+                if task.get("completed", 0):
+                    self.db.uncomplete_task(task_id)
+                self._refresh_tasks()
+        else:
+            reply = QMessageBox.question(
+                self, "归档任务",
+                f"确定要归档任务「{task['name']}」吗？\n（归档后从主列表移除，记录仍保留）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.db.archive_task(task_id)
+                if self.current_task_id == task_id:
+                    self.current_task_id = None
+                    self.current_task_label.setText("当前任务: 无  (⚠ 请先选中一个任务再开始专注)")
+                    self.current_task_label.setStyleSheet(
+                        "font-size: 13px; color: #e67e22; padding: 8px; "
+                        "background: #fff8e1; border-radius: 6px; "
+                        "border: 1px solid #ffe0b2; font-weight: bold;"
+                    )
+                self._refresh_tasks()
+
     def _refresh_tasks(self):
         self.task_list.clear()
-        incomplete = []
-        completed = []
-        for task in self.db.get_tasks():
+        self.archived_task_list.clear()
+        active = []
+        archived = []
+        for task in self.db.get_tasks(include_archived=True):
             self.db.align_task_completion_state(task["id"])
-            if task.get("completed", 0):
-                completed.append(task)
+            if task.get("archived", 0) or task.get("completed", 0):
+                archived.append(task)
             else:
-                incomplete.append(task)
-        sorted_tasks = incomplete + completed
-        for task in sorted_tasks:
-            status = "✅" if task.get("completed", 0) else "⬜"
+                active.append(task)
+        for task in active:
+            status = "⬜"
             cat = task.get("category", "") or ""
             cat_tag = f"[{cat}] " if cat else ""
             item_text = f"{status} {cat_tag}{task['name']} ({task['pomodoros_completed']}/{task['pomodoros_target']})"
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, task["id"])
-            if task.get("completed", 0):
-                item.setForeground(QColor(149, 165, 166))
             self.task_list.addItem(item)
+        for task in archived:
+            if task.get("completed", 0):
+                status = "✅"
+            elif task.get("archived", 0):
+                status = "📦"
+            else:
+                status = "⬜"
+            cat = task.get("category", "") or ""
+            cat_tag = f"[{cat}] " if cat else ""
+            item_text = f"{status} {cat_tag}{task['name']} ({task['pomodoros_completed']}/{task['pomodoros_target']})"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, task["id"])
+            self.archived_task_list.addItem(item)
+        arc_count = len(archived)
+        if arc_count > 0 and not self._archive_panel_expanded:
+            self.archive_toggle_btn.setText(f"📦 已归档 / 已完成 ▼ ({arc_count}项 · 点击展开)")
+        elif arc_count == 0:
+            self.archive_toggle_btn.setText("📦 已归档 / 已完成 (暂无)")
         if self.current_task_id:
             task = self._get_task_by_id(self.current_task_id)
             if task:
-                if task.get("completed", 0):
-                    self.current_task_label.setText("当前任务: 无  (✅ 上一个任务已完成!)")
+                if task.get("completed", 0) or task.get("archived", 0):
+                    self.current_task_label.setText("当前任务: 无  (✅ 上一个任务已完成/归档!)")
                     self.current_task_label.setStyleSheet(
                         "font-size: 13px; color: #27ae60; padding: 8px; "
                         "background: #e8f5e9; border-radius: 6px; "
@@ -971,18 +1076,34 @@ class PomodoroWindow(QWidget):
     def _jump_to_task(self, task_id):
         self._refresh_tasks()
         found = False
+        target_list = None
+        target_index = -1
         for i in range(self.task_list.count()):
             item = self.task_list.item(i)
             if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
-                self.task_list.setCurrentRow(i)
-                self.task_list.scrollToItem(item)
+                target_list = self.task_list
+                target_index = i
                 found = True
                 break
-        if found:
+        if not found:
+            for i in range(self.archived_task_list.count()):
+                item = self.archived_task_list.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
+                    target_list = self.archived_task_list
+                    target_index = i
+                    found = True
+                    if not self._archive_panel_expanded:
+                        self._toggle_archive_panel()
+                    break
+        if found and target_list:
+            target_list.setCurrentRow(target_index)
+            target_list.scrollToItem(target_list.item(target_index))
             task = self._get_task_by_id(task_id)
-            if task and not task.get("completed", 0):
+            if task and not task.get("completed", 0) and not task.get("archived", 0):
                 self.current_task_id = task_id
-                self.current_task_label.setText(f"当前任务: {task['name']}")
+                cat = task.get("category", "") or ""
+                cat_tag = f" [{cat}]" if cat else ""
+                self.current_task_label.setText(f"当前任务: {task['name']}{cat_tag}")
                 self.current_task_label.setStyleSheet(
                     "font-size: 13px; color: #2c3e50; padding: 8px; "
                     "background: #e3f2fd; border-radius: 6px; "

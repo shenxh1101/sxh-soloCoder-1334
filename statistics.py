@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget, QFrame, QComboBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget, QComboBox,
 )
 from PyQt6.QtCore import Qt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -26,6 +26,13 @@ def _minutes_to_hhmm(minutes):
     if h > 0:
         return f"{h}小时"
     return f"{m}分钟"
+
+
+def _safe(d, key, default=0):
+    val = d.get(key) if isinstance(d, dict) else None
+    if val is None:
+        return default
+    return val
 
 
 class StatisticsPanel(QWidget):
@@ -98,10 +105,10 @@ class StatisticsPanel(QWidget):
         self._build_task_rank_tab()
         self._build_category_rank_tab()
         layout.addWidget(self.tabs)
-        eff_label = QLabel("📈 近 14 天效率趋势")
+        eff_label = QLabel("📈 近 14 天效率趋势（柱状=专注分钟，折线=效率）")
         eff_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2c3e50; margin-top: 6px;")
         layout.addWidget(eff_label)
-        self.eff_figure = Figure(figsize=(9, 3.0), dpi=100)
+        self.eff_figure = Figure(figsize=(9.2, 3.6), dpi=100)
         self.eff_canvas = FigureCanvas(self.eff_figure)
         layout.addWidget(self.eff_canvas)
 
@@ -241,7 +248,6 @@ class StatisticsPanel(QWidget):
                 next_first.strftime("%Y-%m-%d") + "T00:00:00")
 
     def _period_range(self, combo):
-        period = None
         try:
             period = combo.currentData()
         except Exception:
@@ -277,23 +283,18 @@ class StatisticsPanel(QWidget):
             start, end = self._today_range()
             stats = self.db.get_summary(start, end)
         except Exception:
-            stats = {
-                "work_minutes": 0, "break_minutes": 0, "long_break_minutes": 0,
-                "abandoned_minutes": 0, "task_completed_count": 0,
-                "work_count": 0, "break_count": 0, "long_break_count": 0,
-            }
-        work = stats.get("work_minutes", 0)
-        brk = stats.get("break_minutes", 0)
-        longb = stats.get("long_break_minutes", 0)
-        total = work + brk + longb
-        completed = stats.get("task_completed_count", 0)
-        wc = stats.get("work_count", 0)
-        bc = stats.get("break_count", 0) + stats.get("long_break_count", 0)
+            stats = {}
+        work = _safe(stats, "work_minutes")
+        brk = _safe(stats, "break_minutes") + _safe(stats, "long_break_minutes")
+        total = work + brk
+        completed = _safe(stats, "task_completed_count")
+        wc = _safe(stats, "work_count")
+        bc = _safe(stats, "break_count") + _safe(stats, "long_break_count")
         today_label = datetime.now().strftime("%Y年%m月%d日")
         self.today_summary.setText(
             f"<b>📆 {today_label}（今天）</b><br>"
-            f"🍅 专注 {wc} 次，共 <b>{_minutes_to_hhmm(work)}</b>　"
-            f"☕ 休息 {bc} 次，共 <b>{_minutes_to_hhmm(brk + longb)}</b><br>"
+            f"🍅 专注 <b>{wc}</b> 次，共 <b>{_minutes_to_hhmm(work)}</b>　"
+            f"☕ 休息 <b>{bc}</b> 次，共 <b>{_minutes_to_hhmm(brk)}</b><br>"
             f"✅ 完成任务 <b>{completed}</b> 个　"
             f"🕒 总计时 <b>{_minutes_to_hhmm(total)}</b>"
         )
@@ -306,10 +307,13 @@ class StatisticsPanel(QWidget):
             self.today_figure.tight_layout()
             self.today_canvas.draw()
             return
+        work_short = _safe(stats, "break_minutes")
+        long_brk = _safe(stats, "long_break_minutes")
         labels = ["专注", "短休息", "长休息"]
-        values = [work, brk, longb]
+        values = [work, work_short, long_brk]
         colors = ["#e74c3c", "#2ecc71", "#3498db"]
-        if sum(v > 0 for v in values) <= 1:
+        non_zero_count = sum(1 for v in values if v > 0)
+        if non_zero_count <= 1:
             ax.bar(labels, values, color=colors, width=0.5, edgecolor="white", linewidth=1)
             for i, v in enumerate(values):
                 if v > 0:
@@ -346,17 +350,20 @@ class StatisticsPanel(QWidget):
             stats = self.db.get_summary(start, end)
         except Exception:
             stats = {}
-        work = stats.get("work_minutes", 0) or 0
-        brk = (stats.get("break_minutes", 0) or 0) + (stats.get("long_break_minutes", 0) or 0)
+        work = _safe(stats, "work_minutes")
+        brk = _safe(stats, "break_minutes") + _safe(stats, "long_break_minutes")
         total = work + brk
-        completed = stats.get("task_completed_count", 0) or 0
-        wc = stats.get("work_count", 0) or 0
-        start_dt = datetime.strptime(start[:10], "%Y-%m-%d")
-        end_dt = datetime.strptime(end[:10], "%Y-%m-%d")
-        week_label = f"{start_dt.strftime('%m月%d日')} ~ {end_dt.strftime('%m月%d日')}"
+        completed = _safe(stats, "task_completed_count")
+        wc = _safe(stats, "work_count")
+        try:
+            start_dt = datetime.strptime(start[:10], "%Y-%m-%d")
+            end_dt = datetime.strptime(end[:10], "%Y-%m-%d")
+            week_label = f"{start_dt.strftime('%m月%d日')} ~ {end_dt.strftime('%m月%d日')}"
+        except Exception:
+            week_label = "本周"
         self.week_summary.setText(
             f"<b>📆 本周（{week_label}）</b><br>"
-            f"🍅 专注 {wc} 次，共 <b>{_minutes_to_hhmm(work)}</b>　"
+            f"🍅 专注 <b>{wc}</b> 次，共 <b>{_minutes_to_hhmm(work)}</b>　"
             f"☕ 休息共 <b>{_minutes_to_hhmm(brk)}</b><br>"
             f"✅ 完成任务 <b>{completed}</b> 个　"
             f"🕒 总计时 <b>{_minutes_to_hhmm(total)}</b>"
@@ -364,18 +371,21 @@ class StatisticsPanel(QWidget):
         days = []
         day_minutes = []
         today = datetime.now()
-        for i in range(7):
-            d = start_dt + timedelta(days=i)
-            d_str = d.strftime("%m-%d")
-            days.append(d_str)
-            try:
-                s = d.strftime("%Y-%m-%d") + "T00:00:00"
-                e = d.strftime("%Y-%m-%d") + "T23:59:59"
-                ds = self.db.get_summary(s, e)
-                day_minutes.append(ds.get("work_minutes", 0) or 0)
-            except Exception:
-                day_minutes.append(0)
-        if all(m == 0 for m in day_minutes):
+        try:
+            for i in range(7):
+                d = start_dt + timedelta(days=i)
+                d_str = d.strftime("%m-%d")
+                days.append(f"周{['一','二','三','四','五','六','日'][d.weekday()]}\n{d_str}")
+                try:
+                    s = d.strftime("%Y-%m-%d") + "T00:00:00"
+                    e = d.strftime("%Y-%m-%d") + "T23:59:59"
+                    ds = self.db.get_summary(s, e)
+                    day_minutes.append(_safe(ds, "work_minutes"))
+                except Exception:
+                    day_minutes.append(0)
+        except Exception:
+            pass
+        if not day_minutes or all(m == 0 for m in day_minutes):
             ax.text(0.5, 0.5, "本周暂无专注数据",
                     ha="center", va="center", fontsize=12, color="#999")
             ax.set_xticks([])
@@ -384,22 +394,26 @@ class StatisticsPanel(QWidget):
             self.week_figure.tight_layout()
             self.week_canvas.draw()
             return
+        max_m = max(day_minutes) if day_minutes else 1
         colors = []
         for m in day_minutes:
             if m <= 0:
                 colors.append("#ecf0f1")
-            elif m < 60:
+            elif m < max_m * 0.3:
                 colors.append("#fcae91")
-            elif m < 120:
+            elif m < max_m * 0.7:
                 colors.append("#fb6a4a")
             else:
                 colors.append("#e74c3c")
-        ax.bar(days, day_minutes, color=colors, edgecolor="white", linewidth=1, width=0.6)
+        ax.bar(range(len(days)), day_minutes, color=colors,
+               edgecolor="white", linewidth=1, width=0.6)
+        ax.set_xticks(range(len(days)))
+        ax.set_xticklabels(days, fontsize=9)
         for i, v in enumerate(day_minutes):
             if v > 0:
-                ax.text(i, v + max(day_minutes) * 0.02,
-                        f"{v}", ha="center", fontsize=9, fontweight="bold")
-        ax.set_ylabel("分钟")
+                ax.text(i, v + max_m * 0.03,
+                        f"{v}", ha="center", fontsize=9, fontweight="bold", color="#c0392b")
+        ax.set_ylabel("专注分钟")
         ax.set_title("本周每日专注时长")
         for spine in ["top", "right"]:
             ax.spines[spine].set_visible(False)
@@ -414,15 +428,15 @@ class StatisticsPanel(QWidget):
             stats = self.db.get_summary(start, end)
         except Exception:
             stats = {}
-        work = stats.get("work_minutes", 0) or 0
-        brk = (stats.get("break_minutes", 0) or 0) + (stats.get("long_break_minutes", 0) or 0)
+        work = _safe(stats, "work_minutes")
+        brk = _safe(stats, "break_minutes") + _safe(stats, "long_break_minutes")
         total = work + brk
-        completed = stats.get("task_completed_count", 0) or 0
-        wc = stats.get("work_count", 0) or 0
+        completed = _safe(stats, "task_completed_count")
+        wc = _safe(stats, "work_count")
         month_label = datetime.now().strftime("%Y年%m月")
         self.month_summary.setText(
             f"<b>📆 {month_label}（本月）</b><br>"
-            f"🍅 专注 {wc} 次，共 <b>{_minutes_to_hhmm(work)}</b>　"
+            f"🍅 专注 <b>{wc}</b> 次，共 <b>{_minutes_to_hhmm(work)}</b>　"
             f"☕ 休息共 <b>{_minutes_to_hhmm(brk)}</b><br>"
             f"✅ 完成任务 <b>{completed}</b> 个　"
             f"🕒 总计时 <b>{_minutes_to_hhmm(total)}</b>"
@@ -438,10 +452,10 @@ class StatisticsPanel(QWidget):
                 s = current.strftime("%Y-%m-%d") + "T00:00:00"
                 e = current.strftime("%Y-%m-%d") + "T23:59:59"
                 ds = self.db.get_summary(s, e)
-                minute_data.append(ds.get("work_minutes", 0) or 0)
+                minute_data.append(_safe(ds, "work_minutes"))
             except Exception:
                 minute_data.append(0)
-        if all(m == 0 for m in minute_data):
+        if not minute_data or all(m == 0 for m in minute_data):
             ax.text(0.5, 0.5, "本月暂无专注数据",
                     ha="center", va="center", fontsize=12, color="#999")
             ax.set_xticks([])
@@ -450,14 +464,21 @@ class StatisticsPanel(QWidget):
             self.month_figure.tight_layout()
             self.month_canvas.draw()
             return
-        ax.plot(day_labels, minute_data, marker="o", markersize=4,
+        ax.plot(range(len(day_labels)), minute_data, marker="o", markersize=4,
                 linewidth=2, color="#e74c3c", markerfacecolor="#fcae91")
-        ax.fill_between(day_labels, minute_data, alpha=0.15, color="#e74c3c")
-        ax.set_ylabel("分钟")
-        ax.set_title("本月每日专注时长走势")
+        ax.fill_between(range(len(day_labels)), minute_data, alpha=0.15, color="#e74c3c")
+        ax.set_xticks(range(len(day_labels)))
+        ax.set_xticklabels(day_labels, fontsize=9)
         for i, t in enumerate(ax.get_xticklabels()):
             if (i + 1) % 3 != 0 and i != len(day_labels) - 1:
                 t.set_visible(False)
+        max_m = max(minute_data) if minute_data else 1
+        for i, v in enumerate(minute_data):
+            if v > 0:
+                ax.text(i, v + max_m * 0.02,
+                        str(v), ha="center", fontsize=8, color="#c0392b")
+        ax.set_ylabel("专注分钟")
+        ax.set_title("本月每日专注时长走势")
         for spine in ["top", "right"]:
             ax.spines[spine].set_visible(False)
         self.month_figure.tight_layout()
@@ -468,10 +489,10 @@ class StatisticsPanel(QWidget):
         ax = self.task_rank_figure.add_subplot(111)
         try:
             start, end = self._period_range(self.task_period_combo)
-            ranking = self.db.get_task_time_ranking(start, end, limit=10)
+            ranking = self.db.get_task_time_ranking(start, end, limit=12)
         except Exception:
             ranking = []
-        total = sum(r.get("total_minutes", 0) or 0 for r in ranking)
+        total = sum(_safe(r, "total_minutes") for r in ranking)
         tasks_count = len(ranking)
         self.task_rank_summary.setText(f"共 {tasks_count} 个任务 · 总投入 {total} 分钟")
         if not ranking:
@@ -486,25 +507,22 @@ class StatisticsPanel(QWidget):
         names = []
         minutes = []
         pomodoros = []
-        categories = []
         for r in ranking:
             cat = r.get("task_category") or ""
             n = r.get("task_name", "未知")
-            if cat:
-                names.append(f"[{cat}] {n}")
-            else:
-                names.append(n)
-            minutes.append(r.get("total_minutes", 0) or 0)
-            pomodoros.append(r.get("pomodoro_count", 0) or 0)
-            categories.append(cat or "未分类")
+            names.append(f"[{cat}] {n}" if cat else n)
+            minutes.append(_safe(r, "total_minutes"))
+            pomodoros.append(_safe(r, "pomodoro_count"))
         names_rev = names[::-1]
         minutes_rev = minutes[::-1]
         pomodoros_rev = pomodoros[::-1]
         bar_colors = [CATEGORY_COLORS[i % len(CATEGORY_COLORS)] for i in range(len(names_rev))]
-        ax.barh(names_rev, minutes_rev, color=bar_colors, edgecolor="white", linewidth=1.2, height=0.6)
+        ax.barh(names_rev, minutes_rev, color=bar_colors,
+                edgecolor="white", linewidth=1.2, height=0.6)
+        max_m = max(minutes_rev) if minutes_rev else 1
         for i, (m, p) in enumerate(zip(minutes_rev, pomodoros_rev)):
             label = f"{m}分钟 ({p}🍅)"
-            ax.text(m + max(minutes_rev) * 0.015, i, label,
+            ax.text(m + max_m * 0.015, i, label,
                     va="center", fontsize=9, fontweight="bold", color="#333")
         ax.set_xlabel("投入分钟")
         ax.set_title(f"任务投入排行 Top {len(names_rev)}")
@@ -523,39 +541,37 @@ class StatisticsPanel(QWidget):
             ranking = self.db.get_category_time_ranking(start, end, limit=10)
         except Exception:
             ranking = []
-        total = sum(r.get("total_minutes", 0) or 0 for r in ranking)
+        total = sum(_safe(r, "total_minutes") for r in ranking)
         cats_count = len(ranking)
         self.category_rank_summary.setText(f"共 {cats_count} 类 · 总投入 {total} 分钟")
         if not ranking:
-            pie_ax.text(0.5, 0.5, "暂无分类数据",
+            for ax in [pie_ax, bar_ax]:
+                ax.text(0.5, 0.5, "暂无分类数据",
                         ha="center", va="center", fontsize=12, color="#999")
-            pie_ax.set_xticks([])
-            pie_ax.set_yticks([])
-            pie_ax.set_frame_on(False)
-            bar_ax.text(0.5, 0.5, "暂无分类数据",
-                        ha="center", va="center", fontsize=12, color="#999")
-            bar_ax.set_xticks([])
-            bar_ax.set_yticks([])
-            bar_ax.set_frame_on(False)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_frame_on(False)
             self.category_pie_figure.tight_layout()
             self.category_pie_canvas.draw()
             self.category_bar_figure.tight_layout()
             self.category_bar_canvas.draw()
             return
         cats = [r.get("category") or "未分类" for r in ranking]
-        minutes = [r.get("total_minutes", 0) or 0 for r in ranking]
-        pomodoros = [r.get("pomodoro_count", 0) or 0 for r in ranking]
-        task_counts = [r.get("task_count", 0) or 0 for r in ranking]
+        minutes = [_safe(r, "total_minutes") for r in ranking]
+        pomodoros = [_safe(r, "pomodoro_count") for r in ranking]
+        task_counts = [_safe(r, "task_count") for r in ranking]
         colors = [CATEGORY_COLORS[i % len(CATEGORY_COLORS)] for i in range(len(cats))]
         cats_rev = cats[::-1]
         minutes_rev = minutes[::-1]
         pomodoros_rev = pomodoros[::-1]
         task_counts_rev = task_counts[::-1]
         colors_rev = colors[::-1]
-        bar_ax.barh(cats_rev, minutes_rev, color=colors_rev, edgecolor="white", linewidth=1.2, height=0.6)
+        max_m = max(minutes_rev) if minutes_rev else 1
+        bar_ax.barh(cats_rev, minutes_rev, color=colors_rev,
+                    edgecolor="white", linewidth=1.2, height=0.6)
         for i, (m, p, t) in enumerate(zip(minutes_rev, pomodoros_rev, task_counts_rev)):
             label = f"{m}分钟 ({p}🍅, {t}任务)"
-            bar_ax.text(m + max(minutes_rev) * 0.015, i, label,
+            bar_ax.text(m + max_m * 0.015, i, label,
                         va="center", fontsize=9, fontweight="bold", color="#333")
         bar_ax.set_xlabel("投入分钟")
         bar_ax.set_title("分类投入排行")
@@ -612,35 +628,54 @@ class StatisticsPanel(QWidget):
             self.eff_figure.tight_layout()
             self.eff_canvas.draw()
             return
-        days = [x.get("date_short", "") for x in trend]
-        minutes = [x.get("work_minutes", 0) or 0 for x in trend]
+        day_labels = [f"{x.get('date', x.get('date_short', ''))}\n周{['一','二','三','四','五','六','日'][datetime.strptime(x.get('date_full', x.get('date', '')), '%Y-%m-%d').weekday()]}" if x.get('date_full') else x.get('date', x.get('date_short', '')) for x in trend]
+        minutes = [x.get("minutes", x.get("work_minutes", 0)) or 0 for x in trend]
         efficiencies = [x.get("efficiency", 0) or 0 for x in trend]
-        xs = list(range(len(days)))
-        ax1.bar(xs, minutes, color="#e74c3c", alpha=0.7, width=0.55,
+        tasks_list = [x.get("tasks", x.get("tasks_completed", 0)) or 0 for x in trend]
+        xs = list(range(len(day_labels)))
+        bar_colors = []
+        max_min = max(minutes) if minutes else 1
+        for m in minutes:
+            if m <= 0:
+                bar_colors.append("#ecf0f1")
+            elif m < max_min * 0.3:
+                bar_colors.append("#fcae91")
+            elif m < max_min * 0.7:
+                bar_colors.append("#fb6a4a")
+            else:
+                bar_colors.append("#e74c3c")
+        ax1.bar(xs, minutes, color=bar_colors, alpha=0.85, width=0.6,
                 edgecolor="white", linewidth=1, label="专注分钟")
         ax1.set_ylabel("专注分钟", color="#e74c3c", fontsize=10)
         ax1.tick_params(axis="y", labelcolor="#e74c3c", labelsize=9)
         ax1.set_xticks(xs)
-        ax1.set_xticklabels(days, fontsize=8)
+        ax1.set_xticklabels(day_labels, fontsize=8)
+        for i, v in enumerate(minutes):
+            if v > 0:
+                ax1.text(i, v + max_min * 0.02,
+                         str(v), ha="center", fontsize=7.5,
+                         color="#c0392b", fontweight="bold")
         line_color = "#2980b9"
-        ax2.plot(xs, efficiencies, color=line_color, marker="o", markersize=4,
-                 linewidth=2, label="效率(任务/h)")
+        ax2.plot(xs, efficiencies, color=line_color, marker="D", markersize=5,
+                 linewidth=2, label="效率(任务/h)", markerfacecolor="white", markeredgewidth=2)
         ax2.set_ylabel("效率 (任务/小时)", color=line_color, fontsize=10)
         ax2.tick_params(axis="y", labelcolor=line_color, labelsize=9)
+        max_eff = max(efficiencies) if efficiencies else 1
+        if max_eff > 0:
+            for i, v in enumerate(efficiencies):
+                if v > 0:
+                    ax2.text(i, v + max_eff * 0.08,
+                             f"{v:.1f}", ha="center", fontsize=7.5,
+                             color=line_color, fontweight="bold")
+        max_idx = minutes.index(max_min) if max_min > 0 else 0
+        best_eff = max(efficiencies) if efficiencies else 0
+        best_eff_idx = efficiencies.index(best_eff) if best_eff > 0 else 0
         for spine in ["top"]:
             ax1.spines[spine].set_visible(False)
             ax2.spines[spine].set_visible(False)
-        for i, v in enumerate(minutes):
-            if v > 0:
-                ax1.text(i, v + max(minutes) * 0.02,
-                         str(v), ha="center", fontsize=8, color="#c0392b")
-        for i, v in enumerate(efficiencies):
-            if v > 0:
-                ax2.text(i, v + (max(efficiencies) or 1) * 0.05,
-                         f"{v:.1f}", ha="center", fontsize=8,
-                         color=line_color, fontweight="bold")
-        self.eff_figure.suptitle("近 14 天 专注时长 & 效率趋势", fontsize=11, y=0.98)
-        self.eff_figure.tight_layout(rect=(0, 0, 1, 0.94))
+        title = f"近 14 天 专注时长 & 效率趋势  ·  最投入: {day_labels[max_idx].replace(chr(10), ' ')} ({max_min}分钟)  ·  最高效: {day_labels[best_eff_idx].replace(chr(10), ' ')} ({best_eff:.1f}任务/h)"
+        self.eff_figure.suptitle(title, fontsize=10, y=0.97)
+        self.eff_figure.tight_layout(rect=(0, 0, 1, 0.93))
         self.eff_canvas.draw()
 
     def refresh_all(self):
