@@ -231,6 +231,28 @@ class Database:
         cursor.execute("SELECT site FROM blocked_sites ORDER BY site")
         return [row["site"] for row in cursor.fetchall()]
 
+    def get_efficiency_trend(self, days=14):
+        end_date = datetime.now()
+        trend = []
+        for i in range(days - 1, -1, -1):
+            d = end_date - timedelta(days=i)
+            stats = self.get_daily_stats(d.strftime("%Y-%m-%d"))
+            work_hours = stats["total_minutes"] / 60.0
+            tasks = stats["tasks_completed"]
+            if work_hours > 0:
+                efficiency = tasks / work_hours if work_hours > 0 else 0
+            else:
+                efficiency = 0
+            trend.append({
+                "date": d.strftime("%m-%d"),
+                "date_full": d.strftime("%Y-%m-%d"),
+                "minutes": stats["total_minutes"],
+                "pomodoros": stats["pomodoro_count"],
+                "tasks": tasks,
+                "efficiency": round(efficiency, 2),
+            })
+        return trend
+
     def export_data(self, export_dir):
         os.makedirs(export_dir, exist_ok=True)
         tasks = self.get_tasks()
