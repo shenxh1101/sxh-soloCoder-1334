@@ -97,6 +97,22 @@ class Database:
         )
         self.conn.commit()
 
+    def update_task_name(self, task_id, new_name):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE tasks SET name=? WHERE id=?",
+            (new_name, task_id),
+        )
+        self.conn.commit()
+
+    def update_task_target(self, task_id, new_target):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE tasks SET pomodoros_target=? WHERE id=?",
+            (max(1, new_target), task_id),
+        )
+        self.conn.commit()
+
     def update_task_pomodoro(self, task_id, increment=1):
         cursor = self.conn.cursor()
         cursor.execute(
@@ -230,6 +246,56 @@ class Database:
         cursor = self.conn.cursor()
         cursor.execute("SELECT site FROM blocked_sites ORDER BY site")
         return [row["site"] for row in cursor.fetchall()]
+
+    def get_records_with_task_names(self, start_date=None, end_date=None, record_type=None):
+        cursor = self.conn.cursor()
+        query = """
+            SELECT pr.*, t.name as task_name
+            FROM pomodoro_records pr
+            LEFT JOIN tasks t ON pr.task_id = t.id
+            WHERE 1=1
+        """
+        params = []
+        if start_date:
+            query += " AND pr.started_at>=?"
+            params.append(start_date)
+        if end_date:
+            query += " AND pr.started_at<=?"
+            params.append(end_date)
+        if record_type:
+            query += " AND pr.type=?"
+            params.append(record_type)
+        query += " ORDER BY pr.started_at DESC"
+        cursor.execute(query, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_task_time_ranking(self, start_date=None, end_date=None, limit=10):
+        cursor = self.conn.cursor()
+        query = """
+            SELECT t.id as task_id, t.name as task_name,
+                   COUNT(pr.id) as pomodoro_count,
+                   SUM(pr.duration_minutes) as total_minutes
+            FROM pomodoro_records pr
+            LEFT JOIN tasks t ON pr.task_id = t.id
+            WHERE pr.type='work'
+        """
+        params = []
+        if start_date:
+            query += " AND pr.started_at>=?"
+            params.append(start_date)
+        if end_date:
+            query += " AND pr.started_at<=?"
+            params.append(end_date)
+        query += " GROUP BY pr.task_id ORDER BY total_minutes DESC LIMIT ?"
+        params.append(limit)
+        cursor.execute(query, params)
+        results = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            if d["task_name"] is None:
+                d["task_name"] = "未指定任务"
+            results.append(d)
+        return results
 
     def get_efficiency_trend(self, days=14):
         end_date = datetime.now()

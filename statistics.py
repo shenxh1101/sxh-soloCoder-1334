@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget,
     QPushButton, QFileDialog, QComboBox,
@@ -10,6 +10,12 @@ import matplotlib
 matplotlib.use("Agg")
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial"]
 matplotlib.rcParams["axes.unicode_minus"] = False
+
+
+TASK_COLORS = [
+    "#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6",
+    "#1abc9c", "#e67e22", "#34495e", "#16a085", "#d35400",
+]
 
 
 class StatisticsPanel(QWidget):
@@ -45,9 +51,11 @@ class StatisticsPanel(QWidget):
         self.daily_tab = self._create_daily_tab()
         self.weekly_tab = self._create_weekly_tab()
         self.monthly_tab = self._create_monthly_tab()
+        self.tasks_tab = self._create_tasks_tab()
         self.tabs.addTab(self.daily_tab, "今日")
         self.tabs.addTab(self.weekly_tab, "本周")
         self.tabs.addTab(self.monthly_tab, "本月")
+        self.tabs.addTab(self.tasks_tab, "任务排行")
         layout.addWidget(self.tabs, stretch=1)
         trend_group_title = QLabel("📈 近 14 天专注效率趋势")
         trend_group_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
@@ -55,7 +63,7 @@ class StatisticsPanel(QWidget):
         self.trend_summary = QLabel()
         self.trend_summary.setStyleSheet("font-size: 13px; color: #555; padding: 6px;")
         layout.addWidget(self.trend_summary)
-        self.trend_figure = Figure(figsize=(8.5, 3), dpi=100)
+        self.trend_figure = Figure(figsize=(8.5, 2.8), dpi=100)
         self.trend_canvas = FigureCanvas(self.trend_figure)
         layout.addWidget(self.trend_canvas)
         refresh_btn = QPushButton("🔄 刷新统计")
@@ -120,6 +128,29 @@ class StatisticsPanel(QWidget):
         layout.addWidget(self.monthly_canvas, stretch=1)
         return widget
 
+    def _create_tasks_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        period_layout = QHBoxLayout()
+        period_layout.addWidget(QLabel("时间范围:"))
+        self.task_period_combo = QComboBox()
+        self.task_period_combo.addItem("今日", "today")
+        self.task_period_combo.addItem("本周", "week")
+        self.task_period_combo.addItem("本月", "month")
+        self.task_period_combo.addItem("全部", "all")
+        self.task_period_combo.setCurrentIndex(1)
+        self.task_period_combo.currentIndexChanged.connect(self._refresh_tasks_safe)
+        period_layout.addWidget(self.task_period_combo)
+        period_layout.addStretch()
+        layout.addLayout(period_layout)
+        self.tasks_summary = QLabel()
+        self.tasks_summary.setStyleSheet("font-size: 13px; color: #555; padding: 10px;")
+        layout.addWidget(self.tasks_summary)
+        self.tasks_figure = Figure(figsize=(8, 3.5), dpi=100)
+        self.tasks_canvas = FigureCanvas(self.tasks_figure)
+        layout.addWidget(self.tasks_canvas, stretch=1)
+        return widget
+
     def refresh(self):
         try:
             self._refresh_daily()
@@ -131,6 +162,10 @@ class StatisticsPanel(QWidget):
             pass
         try:
             self._refresh_monthly_safe()
+        except Exception:
+            pass
+        try:
+            self._refresh_tasks_safe()
         except Exception:
             pass
         try:
@@ -207,18 +242,20 @@ class StatisticsPanel(QWidget):
                 task_counts.append(d["tasks_completed"])
             colors = ["#e74c3c" if v > 0 else "#ecf0f1" for v in y_vals]
             bars = ax.bar(x_labels, y_vals, color=colors, edgecolor="white", linewidth=0.5, label="专注时长(分钟)")
+            max_y = max(y_vals) if y_vals and max(y_vals) > 0 else 1
             for i, (bar, tc) in enumerate(zip(bars, task_counts)):
                 height = bar.get_height()
                 if tc > 0:
                     ax.text(
                         bar.get_x() + bar.get_width() / 2,
-                        height + max(y_vals) * 0.01 if max(y_vals) > 0 else 1,
+                        height + max_y * 0.02,
                         f"{tc} 任务",
                         ha="center", va="bottom", fontsize=9, color="#27ae60", fontweight="bold",
                     )
             ax.set_ylabel("专注时长(分钟)")
             ax.set_title("本周每日专注时长与完成任务数")
             ax.legend(loc="upper left", fontsize=9)
+            ax.set_ylim(0, max_y * 1.15)
         except Exception:
             ax.text(0.5, 0.5, "数据加载失败", ha="center", va="center", fontsize=14, color="#999")
             ax.set_xticks([])
@@ -277,6 +314,78 @@ class StatisticsPanel(QWidget):
             ax.set_yticks([])
         self.monthly_figure.tight_layout()
         self.monthly_canvas.draw()
+
+    def _refresh_tasks_safe(self):
+        try:
+            self._refresh_tasks()
+        except Exception:
+            pass
+
+    def _get_task_period_range(self):
+        period = self.task_period_combo.currentData()
+        today = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now()
+        if period == "today":
+            return f"{today}T00:00:00", f"{today}T23:59:59"
+        elif period == "week":
+            start = now - timedelta(days=6)
+            return start.strftime("%Y-%m-%d") + "T00:00:00", now.strftime("%Y-%m-%d") + "T23:59:59"
+        elif period == "month":
+            start = datetime(now.year, now.month, 1)
+            return start.strftime("%Y-%m-%d") + "T00:00:00", now.strftime("%Y-%m-%d") + "T23:59:59"
+        else:
+            return None, None
+
+    def _refresh_tasks(self):
+        start, end = self._get_task_period_range()
+        ranking = self.db.get_task_time_ranking(start, end, limit=10)
+        total_minutes = sum(r["total_minutes"] for r in ranking if r["total_minutes"])
+        total_pomos = sum(r["pomodoro_count"] for r in ranking if r["pomodoro_count"])
+        self.tasks_summary.setText(
+            f"📋 共 {len(ranking)} 个任务 · "
+            f"⏱ 总投入 {total_minutes} 分钟 · "
+            f"🍅 总番茄 {total_pomos} 个"
+        )
+        self.tasks_figure.clear()
+        ax = self.tasks_figure.add_subplot(111)
+        try:
+            if ranking and total_minutes > 0:
+                names = []
+                minutes = []
+                pomos = []
+                for r in ranking:
+                    name = r["task_name"]
+                    if len(name) > 15:
+                        name = name[:13] + "..."
+                    names.append(name)
+                    minutes.append(r["total_minutes"] if r["total_minutes"] else 0)
+                    pomos.append(r["pomodoro_count"] if r["pomodoro_count"] else 0)
+                names = list(reversed(names))
+                minutes = list(reversed(minutes))
+                pomos = list(reversed(pomos))
+                colors = [TASK_COLORS[i % len(TASK_COLORS)] for i in range(len(names))]
+                bars = ax.barh(names, minutes, color=colors, edgecolor="white", height=0.6)
+                for bar, pomo, minute in zip(bars, pomos, minutes):
+                    width = bar.get_width()
+                    ax.text(
+                        width + max(minutes) * 0.01,
+                        bar.get_y() + bar.get_height() / 2,
+                        f"{minute} 分钟 ({pomo} 个)",
+                        va="center", fontsize=9, color="#555",
+                    )
+                ax.set_xlabel("专注时长(分钟)")
+                ax.set_title("任务投入时间排行")
+                ax.set_xlim(0, max(minutes) * 1.25 if minutes else 1)
+            else:
+                ax.text(0.5, 0.5, "暂无任务数据", ha="center", va="center", fontsize=14, color="#999")
+                ax.set_xticks([])
+                ax.set_yticks([])
+        except Exception:
+            ax.text(0.5, 0.5, "数据加载失败", ha="center", va="center", fontsize=14, color="#999")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        self.tasks_figure.tight_layout()
+        self.tasks_canvas.draw()
 
     def _refresh_trend(self):
         try:

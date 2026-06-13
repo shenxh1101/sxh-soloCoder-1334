@@ -12,6 +12,7 @@ from database import Database
 from audio import AudioPlayer, SOUND_TYPES, ensure_sound_files
 from overlay import ScreenOverlay, WebsiteBlocker
 from statistics import StatisticsPanel
+from history import HistoryPanel
 
 
 class CircularProgressBar(QWidget):
@@ -287,19 +288,23 @@ class PomodoroWindow(QWidget):
         target_layout.addStretch()
         left_layout.addLayout(target_layout)
         self.task_list = QListWidget()
-        self.task_list.setMaximumHeight(200)
+        self.task_list.setMaximumHeight(180)
         left_layout.addWidget(self.task_list)
         task_btn_layout = QHBoxLayout()
-        select_btn = QPushButton("选中为当前任务")
-        select_btn.setStyleSheet("background: #3498db; color: white;")
+        select_btn = QPushButton("选中为当前")
+        select_btn.setStyleSheet("background: #3498db; color: white; font-size: 12px; padding: 6px 10px;")
         select_btn.clicked.connect(self._select_task)
         task_btn_layout.addWidget(select_btn)
-        complete_btn = QPushButton("完成任务")
-        complete_btn.setStyleSheet("background: #27ae60; color: white;")
+        edit_btn = QPushButton("编辑")
+        edit_btn.setStyleSheet("background: #f39c12; color: white; font-size: 12px; padding: 6px 10px;")
+        edit_btn.clicked.connect(self._edit_task)
+        task_btn_layout.addWidget(edit_btn)
+        complete_btn = QPushButton("完成")
+        complete_btn.setStyleSheet("background: #27ae60; color: white; font-size: 12px; padding: 6px 10px;")
         complete_btn.clicked.connect(self._complete_task)
         task_btn_layout.addWidget(complete_btn)
         delete_btn = QPushButton("删除")
-        delete_btn.setStyleSheet("background: #e74c3c; color: white;")
+        delete_btn.setStyleSheet("background: #e74c3c; color: white; font-size: 12px; padding: 6px 10px;")
         delete_btn.clicked.connect(self._delete_task)
         task_btn_layout.addWidget(delete_btn)
         left_layout.addLayout(task_btn_layout)
@@ -373,6 +378,10 @@ class PomodoroWindow(QWidget):
         stats_btn.setStyleSheet("background: #9b59b6; color: white;")
         stats_btn.clicked.connect(self._show_statistics)
         right_btn_layout.addWidget(stats_btn)
+        history_btn = QPushButton("📜 专注记录")
+        history_btn.setStyleSheet("background: #16a085; color: white;")
+        history_btn.clicked.connect(self._show_history)
+        right_btn_layout.addWidget(history_btn)
         settings_btn = QPushButton("⚙ 设置")
         settings_btn.setStyleSheet("background: #34495e; color: white;")
         settings_btn.clicked.connect(self._show_settings)
@@ -504,25 +513,6 @@ class PomodoroWindow(QWidget):
             self.audio_player.play(self.audio_player.current_sound())
         self._update_display()
 
-    def _start_break(self, is_long=False):
-        if is_long:
-            self.state = self.STATE_LONG_BREAK
-            self.long_break_duration = self.db.get_config("long_break_duration", 15)
-            self.total_seconds = self.long_break_duration * 60
-        else:
-            self.state = self.STATE_BREAK
-            self.break_duration = self.db.get_config("break_duration", 5)
-            self.total_seconds = self.break_duration * 60
-        self.remaining_seconds = self.total_seconds
-        self.session_started_at = datetime.now().isoformat()
-        self._is_paused = False
-        self.start_btn.setText("⏸ 暂停")
-        self.timer.start()
-        self.website_blocker.unblock_sites()
-        if self.show_overlay:
-            self.overlay.show_overlay()
-        self._update_display()
-
     def _pause(self):
         self.timer.stop()
         self._is_paused = True
@@ -557,88 +547,144 @@ class PomodoroWindow(QWidget):
         self._update_display()
 
     def _skip(self):
-        self._complete_session()
+        if self.state == self.STATE_WORK:
+            reply = QMessageBox.question(
+                self,
+                "确认放弃",
+                "确定要放弃当前这段专注吗？\n\n放弃后：\n• 不会计入番茄钟计数\n• 不会推进任务进度\n• 仍然会记录一条放弃记录供参考",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            self._complete_session(abandoned=True)
+        else:
+            self._complete_session(abandoned=False)
 
     def _tick(self):
         if self.remaining_seconds > 0:
             self.remaining_seconds -= 1
             self._update_display()
         else:
-            self._complete_session()
+            self._complete_session(abandoned=False)
 
-    def _complete_session(self):
+    def _complete_session(self, abandoned=False):
         self.timer.stop()
         now = datetime.now().isoformat()
+        actual_duration = max(1, (self.total_seconds - self.remaining_seconds) // 60)
         if self.state == self.STATE_WORK:
-            actual_duration = max(1, (self.total_seconds - self.remaining_seconds) // 60)
-            duration_to_record = self.work_duration if actual_duration >= self.work_duration else actual_duration
-            self.db.add_pomodoro_record(
-                self.current_task_id,
-                self.session_started_at or now,
-                now,
-                duration_to_record,
-                "work",
-            )
-            self.pomodoro_count += 1
-            if self.current_task_id:
-                self.db.update_task_pomodoro(self.current_task_id)
-                task = self._get_task_by_id(self.current_task_id)
-                if task and task["pomodoros_completed"] >= task["pomodoros_target"]:
-                    self.db.complete_task(self.current_task_id)
-                    self.current_task_label.setText(
-                        f"当前任务: 无  (✅ 上一个任务已完成!)"
-                    )
-                    self.current_task_label.setStyleSheet(
-                        "font-size: 13px; color: #27ae60; padding: 8px; "
-                        "background: #e8f5e9; border-radius: 6px; "
-                        "border: 1px solid #c8e6c9; font-weight: bold;"
-                    )
-                    self.current_task_id = None
-                    self._refresh_tasks()
-            self._refresh_tasks()
-            if self.pomodoro_count >= self.long_break_interval:
-                QMessageBox.information(
-                    self,
-                    "🍅 长休息提醒",
-                    f"🎉 太棒了！你已完成 {self.long_break_interval} 个番茄钟！\n\n"
-                    f"现在请享受一段 {self.long_break_duration} 分钟的长休息吧！\n"
-                    f"休息结束后计数会自动重置，开始新一轮的专注。",
+            if not abandoned:
+                self.db.add_pomodoro_record(
+                    self.current_task_id,
+                    self.session_started_at or now,
+                    now,
+                    self.work_duration,
+                    "work",
                 )
-                self.pomodoro_count = 0
-                self._start_break(is_long=True)
+                self.pomodoro_count += 1
+                if self.current_task_id:
+                    self.db.update_task_pomodoro(self.current_task_id)
+                    task = self._get_task_by_id(self.current_task_id)
+                    if task and task["pomodoros_completed"] >= task["pomodoros_target"]:
+                        self.db.complete_task(self.current_task_id)
+                        self.current_task_label.setText(
+                            f"当前任务: 无  (✅ 上一个任务已完成!)"
+                        )
+                        self.current_task_label.setStyleSheet(
+                            "font-size: 13px; color: #27ae60; padding: 8px; "
+                            "background: #e8f5e9; border-radius: 6px; "
+                            "border: 1px solid #c8e6c9; font-weight: bold;"
+                        )
+                        self.current_task_id = None
+                        self._refresh_tasks()
+                self._refresh_tasks()
             else:
-                self.auto_start = self.db.get_config("auto_start", False)
-                if self.auto_start:
-                    self._start_break(is_long=False)
+                self.db.add_pomodoro_record(
+                    self.current_task_id,
+                    self.session_started_at or now,
+                    now,
+                    actual_duration,
+                    "abandoned",
+                )
+            self.overlay.hide_overlay()
+            self.website_blocker.unblock_sites()
+            if not abandoned:
+                if self.pomodoro_count >= self.long_break_interval:
+                    QMessageBox.information(
+                        self,
+                        "🍅 长休息提醒",
+                        f"🎉 太棒了！你已完成 {self.long_break_interval} 个番茄钟！\n\n"
+                        f"现在请享受一段 {self.long_break_duration} 分钟的长休息吧！\n"
+                        f"休息结束后计数会自动重置，开始新一轮的专注。",
+                    )
+                    self.pomodoro_count = 0
+                    self._enter_break_state(is_long=True)
                 else:
-                    self.state = self.STATE_IDLE
-                    self.total_seconds = 0
-                    self.remaining_seconds = 0
-                    self._is_paused = False
-                    self.start_btn.setText("☕ 开始短休息")
-                    self.start_btn.clicked.disconnect()
-                    self.start_btn.clicked.connect(self._start_short_break_from_btn)
-                    self.overlay.hide_overlay()
-                    self.website_blocker.unblock_sites()
-                    self._update_display()
+                    self.auto_start = self.db.get_config("auto_start", False)
+                    if self.auto_start:
+                        self._enter_break_state(is_long=False)
+                    else:
+                        self._enter_idle_after_work()
+            else:
+                self._reset_to_idle()
         elif self.state in (self.STATE_BREAK, self.STATE_LONG_BREAK):
             was_long = self.state == self.STATE_LONG_BREAK
-            actual_duration = max(1, (self.total_seconds - self.remaining_seconds) // 60)
             rtype = "long_break" if was_long else "break"
-            self.db.add_pomodoro_record(
-                None,
-                self.session_started_at or now,
-                now,
-                actual_duration,
-                rtype,
-            )
+            if not abandoned:
+                self.db.add_pomodoro_record(
+                    None,
+                    self.session_started_at or now,
+                    now,
+                    self.total_seconds // 60,
+                    rtype,
+                )
+            else:
+                self.db.add_pomodoro_record(
+                    None,
+                    self.session_started_at or now,
+                    now,
+                    actual_duration,
+                    "skip_break",
+                )
             self.overlay.hide_overlay()
             self.auto_start = self.db.get_config("auto_start", False)
-            if self.auto_start:
+            if self.auto_start and not abandoned:
                 self._reset_to_idle()
                 self._start_work_if_ready()
             else:
                 self._reset_to_idle()
+
+    def _enter_break_state(self, is_long=False):
+        if is_long:
+            self.state = self.STATE_LONG_BREAK
+            self.long_break_duration = self.db.get_config("long_break_duration", 15)
+            self.total_seconds = self.long_break_duration * 60
+        else:
+            self.state = self.STATE_BREAK
+            self.break_duration = self.db.get_config("break_duration", 5)
+            self.total_seconds = self.break_duration * 60
+        self.remaining_seconds = self.total_seconds
+        self.session_started_at = datetime.now().isoformat()
+        self._is_paused = False
+        self.start_btn.setText("⏸ 暂停")
+        self.skip_btn.setEnabled(True)
+        self.timer.start()
+        self._update_display()
+
+    def _enter_idle_after_work(self):
+        self.state = self.STATE_IDLE
+        self.total_seconds = 0
+        self.remaining_seconds = 0
+        self.session_started_at = None
+        self._is_paused = False
+        self.start_btn.setText("☕ 开始短休息")
+        try:
+            self.start_btn.clicked.disconnect()
+        except TypeError:
+            pass
+        self.start_btn.clicked.connect(self._start_short_break_from_btn)
+        self.skip_btn.setEnabled(False)
+        self._update_display()
 
     def _reset_to_idle(self):
         self.state = self.STATE_IDLE
@@ -666,7 +712,7 @@ class PomodoroWindow(QWidget):
         except TypeError:
             pass
         self.start_btn.clicked.connect(self._on_start_or_pause)
-        self._start_break(is_long=False)
+        self._enter_break_state(is_long=False)
 
     def _add_task(self):
         name = self.task_input.text().strip()
@@ -702,6 +748,59 @@ class PomodoroWindow(QWidget):
                     "border: 1px solid #90caf9; font-weight: bold;"
                 )
                 self.pomodoro_target_spin.setValue(task.get("pomodoros_target", 1))
+
+    def _edit_task(self):
+        current = self.task_list.currentItem()
+        if not current:
+            QMessageBox.information(self, "提示", "请先选择一个要编辑的任务。")
+            return
+        task_id = current.data(Qt.ItemDataRole.UserRole)
+        task = self._get_task_by_id(task_id)
+        if not task:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("编辑任务")
+        dialog.setMinimumWidth(380)
+        layout = QFormLayout(dialog)
+        name_input = QLineEdit(task["name"])
+        layout.addRow("任务名称:", name_input)
+        target_spin = QSpinBox()
+        target_spin.setRange(1, 100)
+        target_spin.setValue(task.get("pomodoros_target", 1))
+        layout.addRow("目标番茄数:", target_spin)
+        info_label = QLabel(
+            f"已完成: {task.get('pomodoros_completed', 0)} 个番茄\n"
+            f"修改目标番茄数不会影响已完成的进度。"
+        )
+        info_label.setStyleSheet("color: #666; font-size: 12px; padding: 8px; background: #f8f9fa; border-radius: 4px;")
+        layout.addRow("", info_label)
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("保存")
+        save_btn.setStyleSheet("background: #27ae60; color: white; padding: 8px 24px; border-radius: 6px;")
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setStyleSheet("padding: 8px 24px; border-radius: 6px;")
+        btn_layout.addStretch()
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addRow("", btn_layout)
+        result = [False]
+        def on_save():
+            new_name = name_input.text().strip()
+            if not new_name:
+                QMessageBox.warning(dialog, "提示", "任务名称不能为空。")
+                return
+            self.db.update_task_name(task_id, new_name)
+            self.db.update_task_target(task_id, target_spin.value())
+            result[0] = True
+            dialog.accept()
+        save_btn.clicked.connect(on_save)
+        cancel_btn.clicked.connect(dialog.reject)
+        if dialog.exec() == QDialog.DialogCode.Accepted and result[0]:
+            self._refresh_tasks()
+            if self.current_task_id == task_id:
+                updated = self._get_task_by_id(task_id)
+                if updated:
+                    self.current_task_label.setText(f"当前任务: {updated['name']}")
 
     def _complete_task(self):
         current = self.task_list.currentItem()
@@ -810,6 +909,39 @@ class PomodoroWindow(QWidget):
         except Exception:
             pass
         self.stats_window.show()
+
+    def _show_history(self):
+        self.history_window = QWidget()
+        self.history_window.setWindowTitle("📜 专注记录历史")
+        self.history_window.setMinimumSize(650, 550)
+        layout = QVBoxLayout(self.history_window)
+        panel = HistoryPanel(self.db, on_jump_to_task=self._jump_to_task)
+        layout.addWidget(panel)
+        self.history_window.show()
+
+    def _jump_to_task(self, task_id):
+        self._refresh_tasks()
+        found = False
+        for i in range(self.task_list.count()):
+            item = self.task_list.item(i)
+            if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
+                self.task_list.setCurrentRow(i)
+                self.task_list.scrollToItem(item)
+                found = True
+                break
+        if found:
+            task = self._get_task_by_id(task_id)
+            if task and not task.get("completed", 0):
+                self.current_task_id = task_id
+                self.current_task_label.setText(f"当前任务: {task['name']}")
+                self.current_task_label.setStyleSheet(
+                    "font-size: 13px; color: #2c3e50; padding: 8px; "
+                    "background: #e3f2fd; border-radius: 6px; "
+                    "border: 1px solid #90caf9; font-weight: bold;"
+                )
+                self.pomodoro_target_spin.setValue(task.get("pomodoros_target", 1))
+            self.raise_()
+            self.activateWindow()
 
     def _show_settings(self):
         dialog = SettingsDialog(self.db, self)
